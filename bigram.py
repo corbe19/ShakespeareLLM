@@ -4,14 +4,17 @@ from torch.nn import functional as F
 import requests
 
 #<-------------------- Parameters -------------------->
-batch_size = 32
-context_size = 8  # Number of characters used to predict at a time
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-3
+batch_size = 64
+context_size = 256  # Number of characters used to predict at a time
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # Run on GPU if available
 eval_iters = 200
-n_embd = 32  # Size of the embedding vector for each character
+n_embd = 384  # Size of the embedding vector for each character
+n_head = 6
+n_layer = 6
+dropout = 0.2  # Dropout rate for regularization
 
 torch.manual_seed(1337)
 
@@ -59,6 +62,72 @@ def estimate_loss():
     model.train()
     return out
 
+#<-------------------- Self-Attention -------------------->
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(context_size, context_size)))
+
+        self.dropout = nn.Dropout(dropout)  # Dropout for regularization
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)  # (B, T, head_size)
+        q = self.query(x)  # (B, T, head_size)
+        v = self.value(x)  # (B, T, head_size)
+
+        wei = q @ k.transpose(-2, -1) * (C ** -0.5)  # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T,:T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)  # Apply dropout to attention weights
+
+        out = wei @ v  # (B, T, head_size)
+        return out
+
+#<-------------------- Multi-Head Self-Attention -------------------->
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)  # Projection layer to combine heads
+        self.dropout = nn.Dropout(dropout)  # Dropout for regularization
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))  # Apply dropout and projection
+        return out
+
+#<-------------------- Feed Forward -------------------->   
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd), #expand for more complexity
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd), #compress back to original size
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)  # Apply the feed-forward network
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_heads):
+        super().__init__()
+        head_size = n_embd // n_heads
+        self.sa = MultiHeadAttention(n_heads, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
 #<-------------------- Model Definition -------------------->
 class BigramLanguageModel(nn.Module):
 
@@ -66,6 +135,8 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # Lookup table for tokens
         self.position_embedding_table = nn.Embedding(context_size, n_embd) # Lookup table for positions
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # Final layer normalization
         self.lm_head = nn.Linear(n_embd, vocab_size)  # Linear layer for output logits
 
     def forward(self, idx, targets=None):
@@ -73,6 +144,8 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B, T, C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = tok_emb + pos_emb  # (B, T, C)
+        x = self.blocks(x)  # Pass through transformer blocks
+        x = self.ln_f(x)  # Final layer normalization
         logits = self.lm_head(x)  # (B, T, vocab_size)
        
         if targets is None:
@@ -87,12 +160,14 @@ class BigramLanguageModel(nn.Module):
     
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)
+            idx_cond = idx[:, -context_size:] # Helps ensure embedding table is not out of scope
+            logits, loss = self(idx_cond)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
+    
 
 model = BigramLanguageModel()
 m = model.to(device)
